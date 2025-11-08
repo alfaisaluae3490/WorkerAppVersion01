@@ -1,0 +1,86 @@
+-- database/fix_completion_trigger.sql
+-- Fix completion trigger and update existing completed bookings
+
+-- ============================================
+-- RECREATE COMPLETION TRIGGER
+-- ============================================
+DROP TRIGGER IF EXISTS trigger_check_mutual_completion ON bookings;
+DROP FUNCTION IF EXISTS check_mutual_completion();
+
+CREATE OR REPLACE FUNCTION check_mutual_completion()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Check if both customer and worker have marked complete
+  IF NEW.customer_marked_complete = TRUE AND NEW.worker_marked_complete = TRUE THEN
+    
+    -- Update booking to completed
+    UPDATE bookings 
+    SET 
+      status = 'completed',
+      completion_confirmed_at = CURRENT_TIMESTAMP,
+      completed_at = CURRENT_TIMESTAMP
+    WHERE id = NEW.id;
+    
+    -- Update job to completed
+    UPDATE jobs 
+    SET 
+      status = 'completed',
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = NEW.job_id;
+    
+    -- Update worker stats
+    UPDATE worker_profiles
+    SET 
+      total_jobs_completed = total_jobs_completed + 1,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = NEW.worker_id;
+  END IF;
+  
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_check_mutual_completion
+AFTER UPDATE OF customer_marked_complete, worker_marked_complete ON bookings
+FOR EACH ROW
+WHEN (NEW.customer_marked_complete = TRUE AND NEW.worker_marked_complete = TRUE)
+EXECUTE FUNCTION check_mutual_completion();
+
+-- ============================================
+-- FIX EXISTING COMPLETED BOOKINGS
+-- Update jobs and bookings that are already mutually completed
+-- ============================================
+UPDATE bookings
+SET status = 'completed',
+    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+    completion_confirmed_at = COALESCE(completion_confirmed_at, CURRENT_TIMESTAMP)
+WHERE customer_marked_complete = TRUE 
+  AND worker_marked_complete = TRUE
+  AND status != 'completed';
+
+UPDATE jobs
+SET status = 'completed',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id IN (
+  SELECT job_id FROM bookings
+  WHERE customer_marked_complete = TRUE 
+    AND worker_marked_complete = TRUE
+    AND status = 'completed'
+)
+AND status != 'completed';
+
+-- ============================================
+-- VERIFICATION QUERY
+-- Run this to check if fixes worked
+-- ============================================
+-- SELECT 
+--   j.id as job_id,
+--   j.title,
+--   j.status as job_status,
+--   b.id as booking_id,
+--   b.status as booking_status,
+--   b.customer_marked_complete,
+--   b.worker_marked_complete
+-- FROM jobs j
+-- LEFT JOIN bookings b ON j.id = b.job_id
+-- WHERE b.customer_marked_complete = TRUE AND b.worker_marked_complete = TRUE;
